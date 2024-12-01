@@ -41,6 +41,8 @@ static bool cfg_verify;
 static bool cfg_read_all;
 static bool cfg_gro_segment;
 static int  cfg_family		= PF_INET6;
+static uint16_t cfg_mss;
+static bool	cfg_recvmmsg;
 static int  cfg_alen 		= sizeof(struct sockaddr_in6);
 static int  cfg_expected_pkt_nr;
 static int  cfg_expected_pkt_len;
@@ -212,6 +214,51 @@ static void do_verify_udp(const char *data, int len)
 	}
 }
 
+static int recv_mmsg(int fd, char *buf, int left)
+{
+	const int max_nr_msg = ETH_MAX_MTU / ETH_DATA_LEN;
+	struct mmsghdr mmsgs[max_nr_msg];
+	struct iovec iov[max_nr_msg];
+	unsigned int off = 0;
+	int i = 0, ret;
+
+	memset(mmsgs, 0, sizeof(mmsgs));
+
+	printf("left %d, max_nr_msg %d \n", left, max_nr_msg);
+	while (left) {
+                if (i == max_nr_msg)
+			break;
+
+		iov[i].iov_base = buf + off;
+		//iov[i].iov_len = cfg_udp_payload_len < left ? cfg_udp_payload_len : left;
+		iov[i].iov_len = cfg_mss < left ? cfg_mss : left;
+	//	iov[i].iov_len = cfg_udp_payload_len;
+
+	       	mmsgs[i].msg_hdr.msg_iov = iov + i;
+	    	mmsgs[i].msg_hdr.msg_iovlen = 1;
+		/*
+		mmsgs[i].msg_hdr.msg_control = controls[i];
+	      	mmsgs[i].msg_hdr.msg_controllen = sizeof(controls[i]);
+		*/
+
+		off += iov[i].iov_len;
+		left -= iov[i].iov_len;
+		i++;
+	}
+
+	ret = recvmmsg(fd, mmsgs, i + 1, 0, NULL);
+      	if (ret < 0) {
+	     	perror("recvmmsg failed");
+	  	return ret;
+	}
+
+	for (i = 0; i < ret; i++) {
+		printf("Packet %d: %d bytes received\n", i + 1, mmsgs[i].msg_len);
+	}
+
+    	return ret;
+}
+
 static int recv_msg(int fd, char *buf, int len, int *gso_size)
 {
 	char control[CMSG_SPACE(sizeof(int))] = {0};
@@ -253,7 +300,10 @@ static void do_flush_udp(int fd)
 	len = cfg_read_all ? sizeof(rbuf) : 0;
 	while (budget--) {
 		/* MSG_TRUNC will make return value full datagram length */
-		if (!cfg_expected_gso_size)
+
+		if (cfg_recvmmsg)
+			ret = recv_mmsg(fd, rbuf, len);
+		else if (!cfg_expected_gso_size)
 			ret = recv(fd, rbuf, len, MSG_TRUNC | MSG_DONTWAIT);
 		else
 			ret = recv_msg(fd, rbuf, len, &gso_size);
@@ -292,9 +342,10 @@ static void usage(const char *filepath)
 static void parse_opts(int argc, char **argv)
 {
 	const char *bind_addr = NULL;
+	int hdrlen;
 	int c;
 
-	while ((c = getopt(argc, argv, "4b:C:Gl:n:p:rR:S:tv")) != -1) {
+	while ((c = getopt(argc, argv, "4b:C:Gl:mn:p:rR:S:tv")) != -1) {
 		switch (c) {
 		case '4':
 			cfg_family = PF_INET;
@@ -311,6 +362,9 @@ static void parse_opts(int argc, char **argv)
 			break;
 		case 'l':
 			cfg_expected_pkt_len = strtoul(optarg, NULL, 0);
+			break;
+		case 'm':
+			cfg_recvmmsg = true;
 			break;
 		case 'n':
 			cfg_expected_pkt_nr = strtoul(optarg, NULL, 0);
@@ -349,6 +403,14 @@ static void parse_opts(int argc, char **argv)
 
 	if (cfg_tcp && cfg_verify)
 		error(1, 0, "TODO: implement verify mode for tcp");
+
+
+        if (cfg_family == PF_INET)
+                hdrlen = sizeof(struct iphdr) + sizeof(struct udphdr);
+        else
+                hdrlen = sizeof(struct ip6_hdr) + sizeof(struct udphdr);
+
+        cfg_mss = ETH_DATA_LEN - hdrlen;
 }
 
 static void do_recv(void)
